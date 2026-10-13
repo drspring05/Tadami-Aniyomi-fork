@@ -1,4 +1,4 @@
-Import java.util.Properties
+import java.util.Properties
 
 pluginManagement {
     includeBuild("gradle/build-logic")
