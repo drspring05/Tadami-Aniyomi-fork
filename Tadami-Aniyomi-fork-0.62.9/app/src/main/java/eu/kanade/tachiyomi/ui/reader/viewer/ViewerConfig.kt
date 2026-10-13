@@ -1,0 +1,124 @@
+package eu.kanade.tachiyomi.ui.reader.viewer
+
+import eu.kanade.domain.ui.UiPreferences
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import tachiyomi.core.common.preference.Preference
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+
+/**
+ * Common configuration for all viewers.
+ */
+abstract class ViewerConfig(
+    readerPreferences: ReaderPreferences,
+    private val scope: CoroutineScope,
+    uiPreferences: UiPreferences = Injekt.get(),
+) {
+
+    var imagePropertyChangedListener: (() -> Unit)? = null
+
+    var navigationModeChangedListener: (() -> Unit)? = null
+
+    var transitionPropertyChangedListener: (() -> Unit)? = null
+
+    /**
+     * Notified when the double-page spread grouping changes (join/shift). Unlike image property
+     * changes (view recreation over the same items), regrouping requires rebuilding the adapter
+     * items, which only setChapters does.
+     */
+    var spreadPropertyChangedListener: (() -> Unit)? = null
+
+    var tappingInverted = ReaderPreferences.TappingInvertMode.NONE
+    var longTapEnabled = true
+    var usePageTransitions = false
+    var doubleTapAnimDuration = 500
+    var volumeKeysEnabled = false
+    var volumeKeysInverted = false
+    var alwaysShowChapterTransition = true
+    var preloadNextChapter = true
+    var navigationMode = 0
+
+    var customTapZoneActions = readerPreferences.customTapZoneActions().get()
+        protected set
+
+    var navigationOverlayOnStart = false
+
+    var dualPageSplit = false
+        protected set
+
+    var dualPageInvert = false
+        protected set
+
+    var dualPageRotateToFit = false
+        protected set
+
+    var dualPageRotateToFitInvert = false
+        protected set
+
+    var joinDoublePages = false
+        protected set
+
+    private var isEInkMode = uiPreferences.eInkProfile().get().isEnabled
+
+    abstract var navigator: ViewerNavigation
+        protected set
+
+    init {
+        uiPreferences.eInkProfile()
+            .changes()
+            .onEach {
+                isEInkMode = it.isEnabled
+                // РЕШ-2 revival: was `pageTransitions || !isEInkMode` - inverted. On regular
+                // devices the toggle was dead (always true), and e-ink got pref-dependent motion
+                // although reduce-motion is meant to be forced there.
+                usePageTransitions = readerPreferences.pageTransitions().get() && !isEInkMode
+            }
+            .launchIn(scope)
+
+        readerPreferences.readWithLongTap()
+            .register({ longTapEnabled = it })
+
+        readerPreferences.pageTransitions()
+            .register({ usePageTransitions = it && !isEInkMode })
+
+        readerPreferences.doubleTapAnimSpeed()
+            .register({ doubleTapAnimDuration = it })
+
+        readerPreferences.readWithVolumeKeys()
+            .register({ volumeKeysEnabled = it })
+
+        readerPreferences.readWithVolumeKeysInverted()
+            .register({ volumeKeysInverted = it })
+
+        readerPreferences.alwaysShowChapterTransition()
+            .register({ alwaysShowChapterTransition = it }, { transitionPropertyChangedListener?.invoke() })
+
+        readerPreferences.preloadNextChapter()
+            .register({ preloadNextChapter = it })
+
+        readerPreferences.showNavigationOverlayOnStart()
+            .register({ navigationOverlayOnStart = it })
+
+        readerPreferences.customTapZoneActions()
+            .register({ customTapZoneActions = it }, { updateNavigation(navigationMode) })
+    }
+
+    protected abstract fun defaultNavigation(): ViewerNavigation
+
+    abstract fun updateNavigation(navigationMode: Int)
+
+    fun <T> Preference<T>.register(
+        valueAssignment: (T) -> Unit,
+        onChanged: (T) -> Unit = {},
+    ) {
+        changes()
+            .onEach { valueAssignment(it) }
+            .distinctUntilChanged()
+            .onEach { onChanged(it) }
+            .launchIn(scope)
+    }
+}

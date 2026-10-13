@@ -1,0 +1,201 @@
+package eu.kanade.tachiyomi.data.discovery
+
+import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.test.runTest
+import org.junit.Test
+import tachiyomi.domain.discovery.model.DiscoveryMediaType
+import tachiyomi.domain.discovery.model.DiscoveryReleaseStatus
+import tachiyomi.domain.discovery.model.DiscoveryRowType
+import java.io.IOException
+
+class DiscoverySourceRowBuilderTest {
+
+    private class FakeCatalog(
+        private val itemsBySource: Map<Long, List<DiscoveryRowItem>> = emptyMap(),
+        private val latestBySource: Map<Long, List<DiscoveryRowItem>> = emptyMap(),
+        private val failing: Set<Long> = emptySet(),
+        private val failingLatest: Set<Long> = emptySet(),
+    ) : DiscoverySourceCatalog {
+        val requested = mutableListOf<Long>()
+        val requestedLatest = mutableListOf<Pair<Long, Int>>()
+
+        override suspend fun popular(
+            mediaType: DiscoveryMediaType,
+            sourceId: Long,
+            releaseStatuses: Set<DiscoveryReleaseStatus>,
+        ): List<DiscoveryRowItem> {
+            requested += sourceId
+            if (sourceId in failing) throw IOException("boom $sourceId")
+            return itemsBySource[sourceId].orEmpty()
+        }
+
+        override suspend fun popularWithGenres(
+            mediaType: DiscoveryMediaType,
+            sourceId: Long,
+            genres: List<String>,
+            releaseStatuses: Set<DiscoveryReleaseStatus>,
+        ): List<DiscoveryRowItem> = emptyList()
+
+        override suspend fun latest(
+            mediaType: DiscoveryMediaType,
+            sourceId: Long,
+            page: Int,
+            releaseStatuses: Set<DiscoveryReleaseStatus>,
+        ): List<DiscoveryRowItem> {
+            requestedLatest += sourceId to page
+            if (sourceId in failingLatest) throw IOException("latest boom $sourceId")
+            return latestBySource[sourceId].orEmpty()
+        }
+    }
+
+    private fun items(source: String, n: Int) = (1..n).map {
+        DiscoveryRowItem("$source Item$it", "$source item$it".lowercase(), null, null, null, source, 1.0 - it * 0.01)
+    }
+
+    private fun context(
+        sourceIds: List<Long> = emptyList(),
+        sourceId: Long = -1L,
+        pageOffset: Int = 1,
+    ) = DiscoveryBuildContext(
+        mediaType = DiscoveryMediaType.MANGA,
+        seeds = emptyList(),
+        libraryCleanTitles = emptySet(),
+        historyCleanTitles = emptySet(),
+        hiddenCleanTitles = emptySet(),
+        sourceId = sourceId,
+        sourceIds = sourceIds,
+        pageOffset = pageOffset,
+    )
+
+    @Test
+    fun `single weighted source fills up to row cap`() = runTest {
+        val catalog = FakeCatalog(mapOf(1L to items("S1", 25)))
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L)))
+        result.size shouldBe 20
+        result.all { it.provider == "S1" } shouldBe true
+    }
+
+    @Test
+    fun `three sources interleave round-robin and cap at 20`() = runTest {
+        val catalog = FakeCatalog(
+            mapOf(
+                1L to items("S1", 10),
+                2L to items("S2", 10),
+                3L to items("S3", 10),
+            ),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L, 2L, 3L)))
+        result.size shouldBe 20
+        result.take(3).map { it.provider } shouldBe listOf("S1", "S2", "S3")
+        result.count { it.provider == "S1" } shouldBe 7
+        result.count { it.provider == "S2" } shouldBe 7
+        result.count { it.provider == "S3" } shouldBe 6
+    }
+
+    @Test
+    fun `failing source is skipped without failing the row`() = runTest {
+        val catalog = FakeCatalog(
+            itemsBySource = mapOf(2L to items("S2", 10)),
+            failing = setOf(1L),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L, 2L)))
+        result.size shouldBe 10
+        result.all { it.provider == "S2" } shouldBe true
+    }
+
+    @Test
+    fun `manual refresh rotates source order`() = runTest {
+        val catalog = FakeCatalog(
+            mapOf(
+                1L to items("S1", 10),
+                2L to items("S2", 10),
+                3L to items("S3", 10),
+            ),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(
+            context(sourceIds = listOf(1L, 2L, 3L), pageOffset = 2),
+        )
+        result.take(3).map { it.provider } shouldBe listOf("S2", "S3", "S1")
+    }
+
+    @Test
+    fun `empty weighted list falls back to legacy single sourceId`() = runTest {
+        val catalog = FakeCatalog(mapOf(7L to items("Legacy", 5)))
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceId = 7L))
+        result.size shouldBe 5
+        catalog.requested shouldBe listOf(7L)
+    }
+
+    @Test
+    fun `row mixes latest and popular in four to one ratio, latest first`() = runTest {
+        val catalog = FakeCatalog(
+            itemsBySource = mapOf(1L to items("P", 30)),
+            latestBySource = mapOf(1L to items("L", 30)),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L)))
+        result.size shouldBe 20
+        result.count { it.provider == "L" } shouldBe 16
+        result.count { it.provider == "P" } shouldBe 4
+        result.take(16).all { it.provider == "L" } shouldBe true
+    }
+
+    @Test
+    fun `popular duplicates of latest titles are dropped without holes`() = runTest {
+        val catalog = FakeCatalog(
+            itemsBySource = mapOf(1L to items("S1", 25)),
+            latestBySource = mapOf(1L to items("S1", 25)),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L)))
+        result.size shouldBe 20
+        result.map { it.cleanTitle }.distinct().size shouldBe 20
+    }
+
+    @Test
+    fun `latest is requested with pageOffset for manual refresh pagination`() = runTest {
+        val catalog = FakeCatalog(latestBySource = mapOf(1L to items("L", 30)))
+        DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L), pageOffset = 2))
+        catalog.requestedLatest shouldBe listOf(1L to 2)
+    }
+
+    @Test
+    fun `popular failure with working latest keeps row alive`() = runTest {
+        val catalog = FakeCatalog(
+            latestBySource = mapOf(1L to items("L", 10)),
+            failing = setOf(1L),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L)))
+        result.size shouldBe 10
+        result.all { it.provider == "L" } shouldBe true
+    }
+
+    @Test
+    fun `latest failure falls back to popular quota`() = runTest {
+        val catalog = FakeCatalog(
+            itemsBySource = mapOf(1L to items("P", 25)),
+            failingLatest = setOf(1L),
+        )
+        val result = DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L)))
+        result.size shouldBe 20
+        result.all { it.provider == "P" } shouldBe true
+    }
+
+    @Test
+    fun `all sources failing throws so cache is preserved`() = runTest {
+        val catalog = FakeCatalog(failing = setOf(1L, 2L))
+        val result = runCatching {
+            DiscoverySourceRowBuilder(catalog).build(context(sourceIds = listOf(1L, 2L)))
+        }
+        result.isFailure shouldBe true
+    }
+
+    @Test
+    fun `no sources at all yields empty row`() = runTest {
+        val result = DiscoverySourceRowBuilder(FakeCatalog()).build(context())
+        result shouldBe emptyList()
+    }
+
+    @Test
+    fun `builder row type is SOURCE`() {
+        DiscoverySourceRowBuilder(FakeCatalog()).rowType shouldBe DiscoveryRowType.SOURCE
+    }
+}
