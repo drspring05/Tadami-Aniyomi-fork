@@ -1,0 +1,304 @@
+package eu.kanade.tachiyomi.extension.novel.api
+
+import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import mihon.domain.extensionrepo.model.ExtensionRepo
+import org.junit.jupiter.api.Test
+import tachiyomi.domain.extension.novel.model.NovelPlugin
+
+class NovelPluginApiTest {
+
+    @Test
+    fun `fetches plugins from all repos`() = runTest {
+        val repos = listOf(
+            ExtensionRepo(
+                baseUrl = "https://repo.one",
+                name = "Repo One",
+                shortName = null,
+                website = "https://repo.one",
+                signingKeyFingerprint = "fingerprint-1",
+            ),
+            ExtensionRepo(
+                baseUrl = "https://repo.two",
+                name = "Repo Two",
+                shortName = null,
+                website = "https://repo.two",
+                signingKeyFingerprint = "fingerprint-2",
+            ),
+        )
+
+        val payloads = mapOf(
+            "https://repo.one" to """
+                [
+                  {
+                    "id": "one.plugin",
+                    "name": "One",
+                    "site": "https://one.example",
+                    "lang": "en",
+                    "version": 1,
+                    "url": "https://one.example/plugin.js",
+                    "hasSettings": false,
+                    "sha256": "aaa"
+                  }
+                ]
+            """.trimIndent(),
+            "https://repo.two" to """
+                [
+                  {
+                    "id": "two.plugin",
+                    "name": "Two",
+                    "site": "https://two.example",
+                    "lang": "ru",
+                    "version": 2,
+                    "url": "https://two.example/plugin.js",
+                    "hasSettings": true,
+                    "sha256": "bbb"
+                  }
+                ]
+            """.trimIndent(),
+        )
+
+        val api = NovelPluginApi(
+            repoProvider = FakeRepoProvider(repos),
+            fetcher = FakeFetcher(payloads),
+            parser = NovelPluginIndexParser(Json { ignoreUnknownKeys = true }),
+        )
+
+        val plugins = api.fetchAvailablePlugins()
+
+        plugins shouldBe listOf(
+            NovelPlugin.Available(
+                id = "one.plugin",
+                name = "One",
+                site = "https://one.example",
+                lang = "en",
+                versionCode = 1,
+                versionName = "1",
+                url = "https://one.example/plugin.js",
+                iconUrl = null,
+                customJs = null,
+                customCss = null,
+                hasSettings = false,
+                sha256 = "aaa",
+                repoUrl = "https://repo.one",
+                repoName = "Repo One",
+            ),
+            NovelPlugin.Available(
+                id = "two.plugin",
+                name = "Two",
+                site = "https://two.example",
+                lang = "ru",
+                versionCode = 2,
+                versionName = "2",
+                url = "https://two.example/plugin.js",
+                iconUrl = null,
+                customJs = null,
+                customCss = null,
+                hasSettings = true,
+                sha256 = "bbb",
+                repoUrl = "https://repo.two",
+                repoName = "Repo Two",
+            ),
+        )
+    }
+
+    @Test
+    fun `canonical indexUrl wins over base url probing`() = runTest {
+        val repo = ExtensionRepo(
+            baseUrl = "https://repo.one",
+            name = "Repo One",
+            shortName = null,
+            website = "https://repo.one",
+            signingKeyFingerprint = "fingerprint-1",
+            indexUrl = "https://repo.one/repo/index.pb",
+        )
+        val requested = mutableListOf<String>()
+        val api = NovelPluginApi(
+            repoProvider = FakeRepoProvider(listOf(repo)),
+            fetcher = FakeFetcher(
+                payloads = mapOf(
+                    "https://repo.one/repo/index.pb" to """
+                        [
+                          {
+                            "isNovel": true,
+                            "pkg": "one.extension",
+                            "name": "One Ext",
+                            "lang": "all",
+                            "apk": "https://cdn.example/one.apk",
+                            "version": 3,
+                            "sources": [ { "id": "1", "lang": "all", "name": "One", "baseUrl": "https://one.example" } ]
+                          }
+                        ]
+                    """.trimIndent(),
+                ),
+                requested = requested,
+            ),
+            parser = NovelPluginIndexParser(Json { ignoreUnknownKeys = true }),
+        )
+
+        val plugins = api.fetchAvailablePlugins()
+
+        requested shouldBe listOf("https://repo.one/repo/index.pb")
+        plugins.single().id shouldBe "one.extension"
+        plugins.single().isKotlinExtension shouldBe true
+        plugins.single().apkUrl shouldBe "https://cdn.example/one.apk"
+    }
+
+    @Test
+    fun `successful refetch clears previous repo error`() = runTest {
+        val repo = extensionRepo("https://repo.one")
+        val api = NovelPluginApi(
+            repoProvider = FakeRepoProvider(listOf(repo)),
+            fetcher = FlakyFetcher(
+                payloads = mapOf(
+                    "https://repo.one" to """
+                        [
+                          {
+                            "id": "one.plugin",
+                            "name": "One",
+                            "site": "https://one.example",
+                            "lang": "en",
+                            "version": 1,
+                            "url": "https://one.example/plugin.js",
+                            "hasSettings": false,
+                            "sha256": "aaa"
+                          }
+                        ]
+                    """.trimIndent(),
+                ),
+                remainingFailures = 1,
+            ),
+            parser = NovelPluginIndexParser(Json { ignoreUnknownKeys = true }),
+        )
+
+        api.fetchAvailablePlugins() // first call fails -> error recorded
+        api.repoFetchErrors.first().keys shouldBe setOf(repo.baseUrl)
+
+        api.fetchAvailablePlugins() // second call succeeds
+
+        api.repoFetchErrors.first() shouldBe emptyMap()
+    }
+
+    @Test
+    fun `new refresh resets repo errors from a previous refresh`() = runTest {
+        val failingRepo = extensionRepo("https://repo.dead")
+        val healthyRepo = extensionRepo("https://repo.one")
+        val api = NovelPluginApi(
+            // First refresh sees the dead repo; the second refresh does not see it at all.
+            repoProvider = BatchedRepoProvider(listOf(failingRepo), listOf(healthyRepo)),
+            fetcher = FlakyFetcher(
+                payloads = mapOf(
+                    "https://repo.one" to """
+                        [
+                          {
+                            "id": "one.plugin",
+                            "name": "One",
+                            "site": "https://one.example",
+                            "lang": "en",
+                            "version": 1,
+                            "url": "https://one.example/plugin.js",
+                            "hasSettings": false,
+                            "sha256": "aaa"
+                          }
+                        ]
+                    """.trimIndent(),
+                ),
+                remainingFailures = 1,
+            ),
+            parser = NovelPluginIndexParser(Json { ignoreUnknownKeys = true }),
+        )
+
+        api.fetchAvailablePlugins() // first refresh fails -> error recorded
+        api.repoFetchErrors.first().keys shouldBe setOf(failingRepo.baseUrl)
+
+        api.fetchAvailablePlugins() // second refresh no longer touches the failed repo
+
+        api.repoFetchErrors.first() shouldBe emptyMap()
+    }
+
+    @Test
+    fun `blank store name collapses to owner repo instead of raw url`() = runTest {
+        val repo = ExtensionRepo(
+            baseUrl = "https://github.com/novelsourcery/extensions",
+            name = "",
+            shortName = null,
+            website = "https://github.com/novelsourcery",
+            signingKeyFingerprint = "fingerprint-1",
+        )
+        val api = NovelPluginApi(
+            repoProvider = FakeRepoProvider(listOf(repo)),
+            fetcher = FakeFetcher(
+                payloads = mapOf(
+                    "https://github.com/novelsourcery/extensions" to """
+                        [
+                          {
+                            "id": "one.plugin",
+                            "name": "One",
+                            "site": "https://one.example",
+                            "lang": "en",
+                            "version": 1,
+                            "url": "https://one.example/plugin.js",
+                            "hasSettings": false,
+                            "sha256": "aaa"
+                          }
+                        ]
+                    """.trimIndent(),
+                ),
+            ),
+            parser = NovelPluginIndexParser(Json { ignoreUnknownKeys = true }),
+        )
+
+        val plugins = api.fetchAvailablePlugins()
+
+        plugins.single().repoName shouldBe "novelsourcery/extensions"
+    }
+
+    private fun extensionRepo(baseUrl: String): ExtensionRepo = ExtensionRepo(
+        baseUrl = baseUrl,
+        name = baseUrl,
+        shortName = null,
+        website = baseUrl,
+        signingKeyFingerprint = "fingerprint-$baseUrl",
+    )
+
+    private class FakeRepoProvider(
+        private val repos: List<ExtensionRepo>,
+    ) : NovelPluginRepoProvider {
+        override suspend fun getAll(): List<ExtensionRepo> = repos
+    }
+
+    private class FakeFetcher(
+        private val payloads: Map<String, String>,
+        private val requested: MutableList<String> = mutableListOf(),
+    ) : NovelPluginIndexFetcher {
+        override suspend fun fetch(repoUrl: String): String {
+            requested.add(repoUrl)
+            return payloads[repoUrl] ?: error("Missing payload for $repoUrl")
+        }
+    }
+
+    /** Fails the first [remainingFailures] fetches, then serves payloads like [FakeFetcher]. */
+    private class FlakyFetcher(
+        private val payloads: Map<String, String> = emptyMap(),
+        remainingFailures: Int,
+    ) : NovelPluginIndexFetcher {
+        private var remainingFailures = remainingFailures
+        override suspend fun fetch(repoUrl: String): String {
+            if (remainingFailures > 0) {
+                remainingFailures--
+                throw IllegalStateException("Simulated repo failure")
+            }
+            return payloads[repoUrl] ?: error("Missing payload for $repoUrl")
+        }
+    }
+
+    /** Serves a different repo list on every [getAll] call, cycling through the batches. */
+    private class BatchedRepoProvider(
+        private vararg val batches: List<ExtensionRepo>,
+    ) : NovelPluginRepoProvider {
+        private var call = 0
+        override suspend fun getAll(): List<ExtensionRepo> = batches[call++ % batches.size]
+    }
+}
