@@ -1,4 +1,4 @@
-import java.util.Properties
+Import java.util.Properties
 
 pluginManagement {
     includeBuild("gradle/build-logic")
@@ -14,7 +14,7 @@ pluginManagement {
         gradlePluginPortal()
         google()
         mavenCentral()
-        maven(url = "https://www.jitpack.io")
+        maven(url = "https://jitpack.io")
     }
 }
 
@@ -35,9 +35,9 @@ dependencyResolutionManagement {
     }
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        mavenCentral()
         google()
-        maven(url = "https://www.jitpack.io")
+        mavenCentral()
+        maven(url = "https://jitpack.io")
     }
 }
 
